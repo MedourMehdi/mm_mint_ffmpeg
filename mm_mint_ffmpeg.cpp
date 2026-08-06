@@ -87,7 +87,7 @@ static volatile int g_shadow_head = 0;
 static volatile int g_shadow_tail = 0;
 static pthread_mutex_t g_shadow_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-#define VID_BUF_SIZE 24 
+#define VID_BUF_SIZE 24
 static uint8_t *g_vid_ring_buf = NULL;
 static int64_t  g_vid_pts_buf[VID_BUF_SIZE];
 static int      g_vid_buf_size = 0;
@@ -128,6 +128,7 @@ static void st_enableTimerASei(void) { Supexec(enableTimerASei); }
 static volatile int16_t  loadNewSample = 0;
 static int16_t           attenuation_left, attenuation_right;
 static volatile int g_vol_shift = 0;
+static volatile bool g_demux_finished = false;
 
 typedef struct {
     int      src_samplerate;
@@ -151,7 +152,9 @@ typedef struct {
     bool     is_playing;
     bool     is_paused;
     bool     is_muted;
-    bool     dma_started;   
+    bool     dma_started; 
+    int16_t  clk_source;   /* NEW: CLK25M, CLKEXT, CLKOLD */
+    int16_t  setpre_val;   /* NEW: -1 or PRE160/PRE320/… */      
 } snd_state_t;
 
 static snd_state_t g_snd;
@@ -185,6 +188,8 @@ static MFDB g_splash_mfdb = { 0 };
 static volatile bool g_splash_active = false;
 static volatile bool g_playback_started = false;
 static volatile bool g_audio_only = false;
+
+static char g_bin_dir[512] = {0};
 
 typedef struct {
     MFDB mfdb;
@@ -220,44 +225,90 @@ static int16_t mm_ico_win_delta_y = 0;
 static int16_t mm_ico_pxy_control_bar[4];
 static MFDB mm_control_bar_mfdb = { 0 };
 
-static int16_t computer_type = 3;   /* default Falcon */
+static int16_t g_machine_type = 3;   /* default Falcon */
+
+/* ------------------------------------------------------------------ */
+/*  Tables de fréquences exactes par machine                          */
+/* ------------------------------------------------------------------ */
 
 typedef struct {
-    int32_t  frequency;
-    int16_t  clk;        /* CLK25M or CLKEXT */
-    int16_t  prescale;   /* Falcon prescale value */
-    int16_t  clk_type;   /* 0=internal, 1=44.1k ext, 2=48k ext */
+    int32_t  freq;
+    int16_t  prescale;
+    int16_t  clk;
+    int16_t  setpre;        /* -1 = pas de SETPRESCALE, sinon PRE160.. */
 } freq_entry_t;
 
+/* ST/E : 6258, 12517, 25033, 50066 */
+static const freq_entry_t freq_ste[] = {
+    { 50066, CLKOLD, CLK25M, PRE160  },
+    { 25033, CLKOLD, CLK25M, PRE320  },
+    { 12517, CLKOLD, CLK25M, PRE640  },
+    {  6258, CLKOLD, CLK25M, PRE1280 },
+};
 
-static const freq_entry_t freq_table[] = {
-    /* Falcon internal (25.175 MHz) */
-    { 49170, CLK25M, CLK50K, 0 },
-    { 32780, CLK25M, CLK33K, 0 },
-    { 24585, CLK25M, CLK25K, 0 },
-    { 19668, CLK25M, CLK20K, 0 },
-    { 16390, CLK25M, CLK16K, 0 },
-    { 12292, CLK25M, CLK12K, 0 },
-    {  9834, CLK25M, CLK10K, 0 },
-    {  8195, CLK25M, CLK8K,  0 },
-    /* CD external (22.5792 MHz) */
-    { 44100, CLKEXT, CLK50K, 1 },
-    { 29400, CLKEXT, CLK33K, 1 },
-    { 22050, CLKEXT, CLK25K, 1 },
-    { 17640, CLKEXT, CLK20K, 1 },
-    { 14700, CLKEXT, CLK16K, 1 },
-    { 11025, CLKEXT, CLK12K, 1 },
-    {  8820, CLKEXT, CLK10K, 1 },
-    {  7350, CLKEXT, CLK8K,  1 },
-    /* DAT external (24.576 MHz) */
-    { 48000, CLKEXT, CLK50K, 2 },
-    { 32000, CLKEXT, CLK33K, 2 },
-    { 24000, CLKEXT, CLK25K, 2 },
-    { 19200, CLKEXT, CLK20K, 2 },
-    { 16000, CLKEXT, CLK16K, 2 },
-    { 12000, CLKEXT, CLK12K, 2 },
-    {  9600, CLKEXT, CLK10K, 2 },
-    {  8000, CLKEXT, CLK8K,  2 },
+/* TT : 6292, 12584, 25169, 50352 */
+static const freq_entry_t freq_tt[] = {
+    { 50352, CLKOLD, CLK25M, PRE160  },
+    { 25169, CLKOLD, CLK25M, PRE320  },
+    { 12584, CLKOLD, CLK25M, PRE640  },
+    {  6292, CLKOLD, CLK25M, PRE1280 },
+};
+
+/* Falcon interne : 8195 .. 49170 */
+static const freq_entry_t freq_falcon[] = {
+    { 49170, CLK50K, CLK25M, -1 },
+    { 32780, CLK33K, CLK25M, -1 },
+    { 24585, CLK25K, CLK25M, -1 },
+    { 19668, CLK20K, CLK25M, -1 },
+    { 16390, CLK16K, CLK25M, -1 },
+    { 12292, CLK12K, CLK25M, -1 },
+    {  9834, CLK10K, CLK25M, -1 },
+    {  8195, CLK8K,  CLK25M, -1 },
+};
+
+/* ARAnyM : 12300, 24594, 49165 */
+static const freq_entry_t freq_aranym[] = {
+    { 49165, CLK50K, CLK25M, -1 },
+    { 24594, CLK25K, CLK25M, -1 },
+    { 12300, CLK10K, CLK25M, -1 },
+};
+
+/* Vampire V4SA interne */
+static const freq_entry_t freq_vampire[] = {
+    { 50667, CLK50K, CLK25M, -1 },
+    { 25335, CLK25K, CLK25M, -1 },
+    { 12273, CLK12K, CLK25M, -1 },
+};
+
+/* Vampire V4SA CD/44.1k */
+static const freq_entry_t freq_vampire_cd[] = {
+    { 44186, CLK50K, CLKEXT, -1 },
+    { 22094, CLK25K, CLKEXT, -1 },
+    { 11047, CLK12K, CLKEXT, -1 },
+};
+
+/* Milan / FireBee 44.1k */
+static const freq_entry_t freq_ext44[] = {
+    { 44100, CLK50K, CLKEXT, -1 },
+    { 29400, CLK33K, CLKEXT, -1 },
+    { 22050, CLK25K, CLKEXT, -1 },
+    { 17640, CLK20K, CLKEXT, -1 },
+    { 14700, CLK16K, CLKEXT, -1 },
+    { 11025, CLK12K, CLKEXT, -1 },
+    {  8820, CLK10K, CLKEXT, -1 },
+    {  7350, CLK8K,  CLKEXT, -1 },
+};
+
+/* Milan / FireBee 48k */
+static const freq_entry_t freq_ext48[] = {
+    { 48000, CLK50K, CLKEXT, -1 },
+    { 32000, CLK33K, CLKEXT, -1 },
+    { 24000, CLK25K, CLKEXT, -1 },
+    { 19200, CLK20K, CLKEXT, -1 },
+    { 16000, CLK16K, CLKEXT, -1 },
+    { 12000, CLK12K, CLKEXT, -1 },
+    {  9600, CLK10K, CLKEXT, -1 },
+    {  8000, CLK8K,  CLKEXT, -1 },
 };
 
 static void hide_mouse(void);
@@ -306,39 +357,193 @@ static void  toggle_pause(void);
 static void  toggle_mute(void);
 static void  restart_playback(void);
 
-static void detect_computer_type(void)
+static void set_bin_directory(const char *argv0)
+{
+    char cwd[512];
+    g_bin_dir[0] = '\0';
+
+    if (argv0 && argv0[0]) {
+        const char *last_slash = strrchr(argv0, '/');
+        const char *last_backslash = strrchr(argv0, '\\');
+        const char *sep = (last_slash > last_backslash) ? last_slash : last_backslash;
+
+        if (sep) {
+            size_t len = (size_t)(sep - argv0) + 1;
+            if (len >= sizeof(g_bin_dir)) len = sizeof(g_bin_dir) - 1;
+            memcpy(g_bin_dir, argv0, len);
+            g_bin_dir[len] = '\0';
+            return;
+        }
+
+        if (argv0[1] == ':') {
+            int drive = toupper((unsigned char)argv0[0]) - 'A' + 1;
+            if (Dgetcwd(cwd, drive, sizeof(cwd)) == 0) {
+                size_t len = strlen(cwd);
+                if (len > 0 && cwd[len - 1] != '/' && cwd[len - 1] != '\\') {
+                    if (len < sizeof(cwd) - 1) {
+                        cwd[len] = '/';
+                        cwd[len + 1] = '\0';
+                    }
+                }
+                strncpy(g_bin_dir, cwd, sizeof(g_bin_dir) - 1);
+                g_bin_dir[sizeof(g_bin_dir) - 1] = '\0';
+                return;
+            }
+            snprintf(g_bin_dir, sizeof(g_bin_dir), "%c:/", argv0[0]);
+            return;
+        }
+    }
+
+    if (getcwd(cwd, sizeof(cwd) - 1)) {
+        size_t len = strlen(cwd);
+        if (len > 0 && cwd[len - 1] != '/' && cwd[len - 1] != '\\') {
+            strcat(cwd, "/");
+        }
+        strncpy(g_bin_dir, cwd, sizeof(g_bin_dir) - 1);
+        g_bin_dir[sizeof(g_bin_dir) - 1] = '\0';
+    } else {
+        strcpy(g_bin_dir, "./");
+    }
+}
+
+static void detect_machine_type(void)
 {
     long mch = 0;
     if (Getcookie(C__MCH, &mch) == C_FOUND) {
-        computer_type = (int16_t)(mch >> 16);
-    } else {
-        /* No cookie = plain ST, but we default to Falcon (3) for safety */
-        computer_type = 3;
+        g_machine_type = (int16_t)(mch >> 16);
     }
 }
 
-/* Simple external clock detection: returns bitmask
- * bit 0 set = 44.1k ext clock present
- * bit 1 set = 48k ext clock present
- * If you don't have Milan/FireBee/CTPCI hardware, this returns 0
- * and the code falls back to internal Falcon frequencies. */
-static int detect_ext_clocks(void)
-{
-    /* Minimal GPIO probe: if Gpio() is available and returns sensible values,
-     * we trust the strap. For a full timing test, see usound.h. */
-    long gpio = Gpio(GPIO_READ, SND_INQUIRE);
-    int ext1 = 0, ext2 = 0;
+/* ------------------------------------------------------------------ */
+/*  Falcon : timing test pour horloge externe                         */
+/*  Retourne 0 = pas d'ext, 1 = 44.1k, 2 = 48k                      */
+/* ------------------------------------------------------------------ */
 
-    /* If bit 0 of GPIO data can be read and toggled, external clocks exist.
-     * This is a simplified heuristic. On plain Falcon/Aranym, this does nothing. */
-    if (computer_type == 0x04 || computer_type == 0x06) {
-        /* Milan or FireBee/CTPCI: read current selection */
-        if ((gpio & 1L) == 0L) ext1 = 1;  /* 44.1k selected */
-        if ((gpio & 1L) == 1L) ext2 = 1;  /* 48k selected */
-        return (ext1 ? 1 : 0) | (ext2 ? 2 : 0);
-    }
+/* Fonction appelée via Supexec() — tourne en superviseur */
+static int32_t falcon_ext_clock_test_asm(void)
+{
+    register int32_t ret __asm__("d0");
+
+    __asm__ volatile(
+        "   move.w  #0x2500,%%sr          \n"
+        "   lea     0xffff8901.w,%%a1     \n"
+        "   lea     0x4ba.w,%%a0          \n"
+        "   moveq   #2,%%d2               \n"
+        "   moveq   #50,%%d1              \n"
+        "   add.l   (%%a0),%%d2           \n"
+        "   add.l   %%d2,%%d1             \n"
+        "tstart%=:                         \n"
+        "   cmp.l   (%%a0),%%d2           \n"
+        "   bne.s   tstart%=              \n"
+        "   move.b  #1,(%%a1)             \n"
+        "   nop                             \n"
+        "tloop%=:                          \n"
+        "   tst.b   (%%a1)                \n"
+        "   beq.s   tstop%=               \n"
+        "   cmp.l   (%%a0),%%d1           \n"
+        "   bne.s   tloop%=               \n"
+        "   clr.b   (%%a1)                \n"
+        "tstop%=:                          \n"
+        "   move.l  (%%a0),%%d0           \n"
+        "   sub.l   %%d2,%%d0             \n"
+        "   move.w  #0x2300,%%sr          \n"
+        : "=d"(ret)
+        :
+        : "d1", "d2", "a0", "a1", "cc", "memory"
+    );
+    return ret;
+}
+
+/* Configure CLKEXT et retourne recv_pathclk — appelée via Supexec() */
+static long falcon_setup_ext_clock(void)
+{
+    long recvPathclk;
+
+    __asm__ volatile(
+        "   and.w   #0x0FFF,0xFFFF8930:w  \n"
+        "   or.w    #0x6000,0xFFFF8930:w  \n"
+        "   move.w  0xFFFF8932:w,%0       \n"
+        : "=d"(recvPathclk)
+        :
+        : "cc", "memory"
+    );
+
+    /* Devconnect(DMAPLAY, DAC, CLKEXT, CLK50K, NO_SHAKE) */
+    __asm__ volatile(
+        "   move.w  %5,%%sp@-             \n"
+        "   move.w  %4,%%sp@-             \n"
+        "   move.w  %3,%%sp@-             \n"
+        "   move.w  %2,%%sp@-             \n"
+        "   move.w  %1,%%sp@-             \n"
+        "   move.w  #139,%%sp@-           \n"
+        "   move.w  %0,%%d2               \n"
+        "   trap    #14                   \n"
+        "   lea     12(%%sp),%%sp         \n"
+        :
+        : "d"(recvPathclk), "i"(DMAPLAY), "i"(DAC),
+          "i"(CLKEXT), "i"(CLK50K), "i"(NO_SHAKE)
+        : "d1", "d2", "a0", "a1", "a2", "cc", "memory"
+    );
+
+    return 0;   /* valeur de retour ignorée */
+}
+
+static int falcon_detect_ext_clock(void)
+{
+    if (g_machine_type != 3)
+        return 0;
+
+    const int TEST_BUFSIZE = 8820;
+    int8_t *bufs = (int8_t *)Mxalloc(TEST_BUFSIZE, MX_STRAM);
+    if ((long)bufs == -32)
+        bufs = (int8_t *)Malloc(TEST_BUFSIZE);
+    if (!bufs)
+        return 0;
+
+    int8_t *bufe = bufs + TEST_BUFSIZE;
+    memset(bufs, 0, TEST_BUFSIZE);
+
+    Locksnd();
+    Sndstatus(SND_RESET);
+
+    /* CHANGED: tout le setup hardware passe par Supexec() */
+    Supexec(falcon_setup_ext_clock);
+
+    Setmode(MODE_MONO);
+    Soundcmd(ADDERIN, MATIN);
+    Setbuffer(SR_PLAY, bufs, bufe);
+
+    Gpio(GPIO_SET, 0x07);
+    Gpio(GPIO_WRITE, 0x03);
+
+    long ticks = Supexec(falcon_ext_clock_test_asm);
+
+    Buffoper(0x00);
+    Sndstatus(SND_RESET);
+    Unlocksnd();
+    Mfree(bufs);
+
+    if (ticks >= 36 && ticks <= 38)
+        return 2;   /* 48 kHz */
+    if (ticks >= 39 && ticks <= 41)
+        return 1;   /* 44.1 kHz */
     return 0;
 }
+
+/* ------------------------------------------------------------------ */
+/*  Milan / Vampire : lecture GPIO                                    */
+/* ------------------------------------------------------------------ */
+
+static int milan_vampire_gpio_clock(void)
+{
+    if (g_machine_type != 4 && g_machine_type != 6)
+        return 0;
+
+    long gpio = Gpio(GPIO_READ, SND_INQUIRE);
+    /* bit 0 = 0 → 44.1k, bit 0 = 1 → 48k (selon ton strap) */
+    return ((gpio & 1L) == 0L) ? 1 : 2;
+}
+
 
 static void shadow_push(AVPacket *pkt) {   /* CHANGED: blocking */
     pthread_mutex_lock(&g_shadow_mutex);
@@ -509,8 +714,18 @@ static void *st_Win_Redraw(void * /*p*/)
 
 static void ico_decompress(const char *file_name, MFDB *foreground_mfdb)
 {
-    FILE *fp = fopen(file_name, "rb");
-    if (!fp) { printf("WARN: icon not found: %s\n", file_name); return; }
+    char full_path[512];
+
+    if (g_bin_dir[0] && file_name[0] != '/' && file_name[1] != ':') {
+        /* Chemin relatif : on le préfixe avec le répertoire du binaire */
+        snprintf(full_path, sizeof(full_path), "%s%s", g_bin_dir, file_name);
+    } else {
+        strncpy(full_path, file_name, sizeof(full_path) - 1);
+        full_path[sizeof(full_path) - 1] = '\0';
+    }
+
+    FILE *fp = fopen(full_path, "rb");
+    if (!fp) { printf("WARN: icon not found: %s\n", full_path); return; }
 
     uint8_t header[BYTES_TO_CHECK];
     fread(header, 1, BYTES_TO_CHECK, fp);
@@ -1302,49 +1517,91 @@ static void *exec_eventloop(void * /*p*/)
 static void snd_compute_prescale(void)
 {
     int32_t sr = g_snd.src_samplerate;
-    int ext_clocks = detect_ext_clocks();
-    const freq_entry_t *best = NULL;
-    int32_t best_delta = INT32_MAX;
-    size_t i;
+    const freq_entry_t *base = NULL;
+    size_t base_count = 0;
+    int ext = 0;
 
-    for (i = 0; i < sizeof(freq_table) / sizeof(freq_table[0]); i++) {
-        const freq_entry_t *f = &freq_table[i];
+    switch (g_machine_type) {
+        case 0:                     /* ST/E */
+            base = freq_ste;
+            base_count = sizeof(freq_ste) / sizeof(freq_ste[0]);
+            break;
 
-        /* Skip external clock entries if that clock is not present */
-        if (f->clk_type == 1 && !(ext_clocks & 1)) continue;
-        if (f->clk_type == 2 && !(ext_clocks & 2)) continue;
+        case 2:                     /* TT */
+            base = freq_tt;
+            base_count = sizeof(freq_tt) / sizeof(freq_tt[0]);
+            break;
 
-        int32_t delta = abs(f->frequency - sr);
-        if (delta < best_delta) {
-            best_delta = delta;
-            best = f;
+        case 5:                     /* ARAnyM */
+            base = freq_aranym;
+            base_count = sizeof(freq_aranym) / sizeof(freq_aranym[0]);
+            break;
+
+        case 6:                     /* Vampire V4SA */
+            ext = milan_vampire_gpio_clock();
+            if (ext == 1) {
+                base = freq_vampire_cd;
+                base_count = sizeof(freq_vampire_cd) / sizeof(freq_vampire_cd[0]);
+            } else {
+                base = freq_vampire;
+                base_count = sizeof(freq_vampire) / sizeof(freq_vampire[0]);
+            }
+            break;
+
+        case 4:                     /* Milan */
+            ext = milan_vampire_gpio_clock();
+            if (ext == 1) {
+                base = freq_ext44;
+                base_count = sizeof(freq_ext44) / sizeof(freq_ext44[0]);
+            } else if (ext == 2) {
+                base = freq_ext48;
+                base_count = sizeof(freq_ext48) / sizeof(freq_ext48[0]);
+            } else {
+                base = freq_falcon;
+                base_count = sizeof(freq_falcon) / sizeof(freq_falcon[0]);
+            }
+            break;
+
+        case 3:                     /* Falcon */
+        default:
+            ext = falcon_detect_ext_clock();
+            if (ext == 1) {
+                base = freq_ext44;
+                base_count = sizeof(freq_ext44) / sizeof(freq_ext44[0]);
+            } else if (ext == 2) {
+                base = freq_ext48;
+                base_count = sizeof(freq_ext48) / sizeof(freq_ext48[0]);
+            } else {
+                base = freq_falcon;
+                base_count = sizeof(freq_falcon) / sizeof(freq_falcon[0]);
+            }
+            break;
+    }
+
+    /* Nearest match */
+    const freq_entry_t *best = &base[0];
+    int32_t best_delta = labs(base[0].freq - sr);
+
+    for (size_t i = 1; i < base_count; i++) {
+        int32_t d = labs(base[i].freq - sr);
+        if (d < best_delta) {
+            best_delta = d;
+            best = &base[i];
         }
     }
 
-    if (!best) {
-        /* Fallback: should never happen, but use safe defaults */
-        best = &freq_table[2];  /* 24585 Hz */
-    }
-
-    g_snd.clk_prescale      = best->prescale;
-    g_snd.atari_effective_sr = best->frequency;
+    g_snd.clk_prescale       = best->prescale;
+    g_snd.atari_effective_sr = best->freq;
+    g_snd.clk_source         = best->clk;
+    g_snd.setpre_val         = best->setpre;
 
     if (g_disable_resample)
         g_snd.wanted_sr = g_snd.src_samplerate;
     else
         g_snd.wanted_sr = g_snd.atari_effective_sr;
 
-    /* If using external clock, configure GPIO (Milan/FireBee only) */
-    if (best->clk == CLKEXT) {
-        if (best->clk_type == 1) {
-            Gpio(GPIO_WRITE, 0x02);  /* select 44.1k ext clock */
-        } else if (best->clk_type == 2) {
-            Gpio(GPIO_WRITE, 0x03);  /* select 48k ext clock */
-        }
-    }
-
-    printf("Audio: wanted %ldHz -> DMA %ldHz (prescale %d, clk %s)\n",
-           sr, g_snd.atari_effective_sr, best->prescale,
+    printf("Audio: wanted %ldHz -> DMA %ldHz (machine=%d prescale=%d clk=%s)\n",
+           sr, g_snd.atari_effective_sr, g_machine_type, best->prescale,
            best->clk == CLKEXT ? "EXT" : "25M");
 }
 
@@ -1430,7 +1687,7 @@ static void snd_fill_logical(void)
 
         AVPacket *pkt = NULL;
         if (shadow_pop(&pkt) != 0) {
-            if (g_snd.dma_started) {
+            if (g_snd.dma_started && !g_demux_finished) {
                 pthread_yield_np();
                 continue;
             } else {
@@ -1481,7 +1738,10 @@ static void snd_init_dma(void)
     Soundcmd(ADCINPUT, 0);
 
     if (Setmode(MODE_STEREO16) != 0) printf("ERROR: Can not set MODE_STEREO16\n");
-    Devconnect(DMAPLAY, DAC, CLK25M, g_snd.clk_prescale, NO_SHAKE);
+    Devconnect(DMAPLAY, DAC, g_snd.clk_source, g_snd.clk_prescale, NO_SHAKE);
+    if (g_snd.setpre_val >= 0) {
+        Soundcmd(SETPRESCALE, g_snd.setpre_val);
+    }
 
     if (Setbuffer(SR_PLAY, g_snd.pPhysical, g_snd.pPhysical + g_snd.bufferSize) != 0) 
         printf("ERROR: st_Setbuffer\n");
@@ -1722,6 +1982,15 @@ audio_init:
                g_snd.atari_effective_sr, g_snd.clk_prescale, g_snd.wanted_sr,
                g_disable_resample ? "[NO RESAMPLE]" : "[RESAMPLING]");
     }
+
+    /* Si pas de son : initialise le framerate wall-clock pour la vidéo seule */
+    if (g_snd.stream_index < 0 && g_vid.stream_index >= 0) {
+        if (g_vid.fps > 0.0)
+            g_vid.time_per_frame_wall = 1000.0 / g_vid.fps;
+        else
+            g_vid.time_per_frame_wall = 1000.0 / 25.0;
+    }
+
 init_done:;
 }
 
@@ -1793,6 +2062,7 @@ static void *thread_demux_decode(void * /*p*/)
         }
     }
 
+    g_demux_finished = true;
     av_packet_free(&pkt);
     g_vid.is_playing = false;
     return NULL;
@@ -1975,20 +2245,48 @@ int main(int argc, char *argv[])
     const char *filename = NULL;
     const char *win_title = NULL;
 
+set_bin_directory(argv[0]);
+
+    int first_file_arg = -1;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--disable-resample") == 0) {
             g_disable_resample = true;
         } else if (strcmp(argv[i], "--direct-play") == 0) {
             g_direct_play = true;
-        } else {
-            if (filename == NULL) {
-                strncpy(path_buf, argv[i], sizeof(path_buf) - 1);
-                path_buf[sizeof(path_buf) - 1] = '\0';
-                normalize_path(path_buf);
-                filename  = path_buf;
-                win_title = get_basename(path_buf);
-            }
+        } else if (first_file_arg < 0) {
+            first_file_arg = i;
         }
+    }
+
+    if (first_file_arg >= 0) {
+        /* Reconstruit le chemin en joignant les arguments restants avec des espaces.
+           Cela corrige le cas où un chemin avec espace a été découpé par le shell. */
+        size_t pos = 0;
+        for (int i = first_file_arg; i < argc && pos < sizeof(path_buf) - 1; i++) {
+            if (i > first_file_arg) {
+                if (pos < sizeof(path_buf) - 1)
+                    path_buf[pos++] = ' ';
+            }
+            size_t arglen = strlen(argv[i]);
+            if (pos + arglen >= sizeof(path_buf) - 1)
+                arglen = sizeof(path_buf) - 1 - pos;
+            if (arglen > 0)
+                memcpy(path_buf + pos, argv[i], arglen);
+            pos += arglen;
+        }
+        path_buf[pos] = '\0';
+
+        /* Certains C runtimes Atari conservent les guillemets — on les retire */
+        size_t len = strlen(path_buf);
+        if (len >= 2 && ((path_buf[0] == '"' && path_buf[len - 1] == '"') ||
+                         (path_buf[0] == '\'' && path_buf[len - 1] == '\''))) {
+            memmove(path_buf, path_buf + 1, len - 2);
+            path_buf[len - 2] = '\0';
+        }
+
+        normalize_path(path_buf);
+        filename  = path_buf;
+        win_title = get_basename(path_buf);
     }
 
     if (filename == NULL) {
@@ -2014,6 +2312,7 @@ int main(int argc, char *argv[])
         g_playback_started = false;
         g_audio_only = false;
         g_splash_active = false;
+        g_demux_finished = false;
 
         memset(&g_vid, 0, sizeof(g_vid));
         memset(&g_snd, 0, sizeof(g_snd));
@@ -2025,7 +2324,7 @@ int main(int argc, char *argv[])
         g_shadow_tail = 0;
         memset(g_audio_shadow, 0, sizeof(g_audio_shadow));
 
-        detect_computer_type();
+        detect_machine_type();
         vid_init(filename);
         if (app_end) break;
 
