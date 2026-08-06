@@ -220,6 +220,46 @@ static int16_t mm_ico_win_delta_y = 0;
 static int16_t mm_ico_pxy_control_bar[4];
 static MFDB mm_control_bar_mfdb = { 0 };
 
+static int16_t computer_type = 3;   /* default Falcon */
+
+typedef struct {
+    int32_t  frequency;
+    int16_t  clk;        /* CLK25M or CLKEXT */
+    int16_t  prescale;   /* Falcon prescale value */
+    int16_t  clk_type;   /* 0=internal, 1=44.1k ext, 2=48k ext */
+} freq_entry_t;
+
+
+static const freq_entry_t freq_table[] = {
+    /* Falcon internal (25.175 MHz) */
+    { 49170, CLK25M, CLK50K, 0 },
+    { 32780, CLK25M, CLK33K, 0 },
+    { 24585, CLK25M, CLK25K, 0 },
+    { 19668, CLK25M, CLK20K, 0 },
+    { 16390, CLK25M, CLK16K, 0 },
+    { 12292, CLK25M, CLK12K, 0 },
+    {  9834, CLK25M, CLK10K, 0 },
+    {  8195, CLK25M, CLK8K,  0 },
+    /* CD external (22.5792 MHz) */
+    { 44100, CLKEXT, CLK50K, 1 },
+    { 29400, CLKEXT, CLK33K, 1 },
+    { 22050, CLKEXT, CLK25K, 1 },
+    { 17640, CLKEXT, CLK20K, 1 },
+    { 14700, CLKEXT, CLK16K, 1 },
+    { 11025, CLKEXT, CLK12K, 1 },
+    {  8820, CLKEXT, CLK10K, 1 },
+    {  7350, CLKEXT, CLK8K,  1 },
+    /* DAT external (24.576 MHz) */
+    { 48000, CLKEXT, CLK50K, 2 },
+    { 32000, CLKEXT, CLK33K, 2 },
+    { 24000, CLKEXT, CLK25K, 2 },
+    { 19200, CLKEXT, CLK20K, 2 },
+    { 16000, CLKEXT, CLK16K, 2 },
+    { 12000, CLKEXT, CLK12K, 2 },
+    {  9600, CLKEXT, CLK10K, 2 },
+    {  8000, CLKEXT, CLK8K,  2 },
+};
+
 static void hide_mouse(void);
 static void show_mouse(void);
 static void open_vwork(void);
@@ -265,6 +305,40 @@ static void  vol_down(void);
 static void  toggle_pause(void);
 static void  toggle_mute(void);
 static void  restart_playback(void);
+
+static void detect_computer_type(void)
+{
+    long mch = 0;
+    if (Getcookie(C__MCH, &mch) == C_FOUND) {
+        computer_type = (int16_t)(mch >> 16);
+    } else {
+        /* No cookie = plain ST, but we default to Falcon (3) for safety */
+        computer_type = 3;
+    }
+}
+
+/* Simple external clock detection: returns bitmask
+ * bit 0 set = 44.1k ext clock present
+ * bit 1 set = 48k ext clock present
+ * If you don't have Milan/FireBee/CTPCI hardware, this returns 0
+ * and the code falls back to internal Falcon frequencies. */
+static int detect_ext_clocks(void)
+{
+    /* Minimal GPIO probe: if Gpio() is available and returns sensible values,
+     * we trust the strap. For a full timing test, see usound.h. */
+    long gpio = Gpio(GPIO_READ, SND_INQUIRE);
+    int ext1 = 0, ext2 = 0;
+
+    /* If bit 0 of GPIO data can be read and toggled, external clocks exist.
+     * This is a simplified heuristic. On plain Falcon/Aranym, this does nothing. */
+    if (computer_type == 0x04 || computer_type == 0x06) {
+        /* Milan or FireBee/CTPCI: read current selection */
+        if ((gpio & 1L) == 0L) ext1 = 1;  /* 44.1k selected */
+        if ((gpio & 1L) == 1L) ext2 = 1;  /* 48k selected */
+        return (ext1 ? 1 : 0) | (ext2 ? 2 : 0);
+    }
+    return 0;
+}
 
 static void shadow_push(AVPacket *pkt) {   /* CHANGED: blocking */
     pthread_mutex_lock(&g_shadow_mutex);
@@ -1127,9 +1201,9 @@ static void *exec_eventloop(void * /*p*/)
                 app_end = true;
                 break;
             case WM_REDRAW:
-                if (!g_vid.is_playing && !g_playback_started) {
+                if (g_splash_active) {
                     st_Win_Redraw(NULL);
-                    if (g_splash_active) splash_draw();
+                    splash_draw();
                 } else if (!g_vid.is_playing) {
                     st_Win_Redraw(NULL);
                 }
@@ -1228,20 +1302,50 @@ static void *exec_eventloop(void * /*p*/)
 static void snd_compute_prescale(void)
 {
     int32_t sr = g_snd.src_samplerate;
-    int16_t p = (int16_t)(((25175000 / 256) / sr) - 1);
+    int ext_clocks = detect_ext_clocks();
+    const freq_entry_t *best = NULL;
+    int32_t best_delta = INT32_MAX;
+    size_t i;
 
-    switch (p) {
-    case 1: g_snd.clk_prescale = 1; g_snd.atari_effective_sr = 49170; break;
-    case 2: g_snd.clk_prescale = 2; g_snd.atari_effective_sr = 32780; break;
-    case 3: g_snd.clk_prescale = 3; g_snd.atari_effective_sr = 24585; break;
-    case 4: g_snd.clk_prescale = 4; g_snd.atari_effective_sr = 19668; break;
-    default:g_snd.clk_prescale = 3; g_snd.atari_effective_sr = 24585; break;
+    for (i = 0; i < sizeof(freq_table) / sizeof(freq_table[0]); i++) {
+        const freq_entry_t *f = &freq_table[i];
+
+        /* Skip external clock entries if that clock is not present */
+        if (f->clk_type == 1 && !(ext_clocks & 1)) continue;
+        if (f->clk_type == 2 && !(ext_clocks & 2)) continue;
+
+        int32_t delta = abs(f->frequency - sr);
+        if (delta < best_delta) {
+            best_delta = delta;
+            best = f;
+        }
     }
+
+    if (!best) {
+        /* Fallback: should never happen, but use safe defaults */
+        best = &freq_table[2];  /* 24585 Hz */
+    }
+
+    g_snd.clk_prescale      = best->prescale;
+    g_snd.atari_effective_sr = best->frequency;
 
     if (g_disable_resample)
         g_snd.wanted_sr = g_snd.src_samplerate;
     else
         g_snd.wanted_sr = g_snd.atari_effective_sr;
+
+    /* If using external clock, configure GPIO (Milan/FireBee only) */
+    if (best->clk == CLKEXT) {
+        if (best->clk_type == 1) {
+            Gpio(GPIO_WRITE, 0x02);  /* select 44.1k ext clock */
+        } else if (best->clk_type == 2) {
+            Gpio(GPIO_WRITE, 0x03);  /* select 48k ext clock */
+        }
+    }
+
+    printf("Audio: wanted %ldHz -> DMA %ldHz (prescale %d, clk %s)\n",
+           sr, g_snd.atari_effective_sr, best->prescale,
+           best->clk == CLKEXT ? "EXT" : "25M");
 }
 
 static void apply_volume_shift(int16_t *buf, uint32_t samples)
@@ -1921,6 +2025,7 @@ int main(int argc, char *argv[])
         g_shadow_tail = 0;
         memset(g_audio_shadow, 0, sizeof(g_audio_shadow));
 
+        detect_computer_type();
         vid_init(filename);
         if (app_end) break;
 
