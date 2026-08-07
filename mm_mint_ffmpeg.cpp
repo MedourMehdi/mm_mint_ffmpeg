@@ -81,7 +81,7 @@ static bool g_disable_resample = false;
 static bool g_direct_play = false;
 static volatile bool g_restart_requested = false;
 
-#define SHADOW_BUF_SIZE 256   /* CHANGED: was 32 */
+#define SHADOW_BUF_SIZE 128   /* CHANGED: was 32 */
 static AVPacket* g_audio_shadow[SHADOW_BUF_SIZE];
 static volatile int g_shadow_head = 0;
 static volatile int g_shadow_tail = 0;
@@ -93,6 +93,14 @@ static int64_t  g_vid_pts_buf[VID_BUF_SIZE];
 static int      g_vid_buf_size = 0;
 static volatile int g_vid_head = 0;
 static volatile int g_vid_tail = 0;
+
+static int16_t g_vid_off_x = 0;
+static int16_t g_vid_off_y = 0;
+
+static volatile bool g_fullscreen = false;
+static volatile bool g_fs_requested = false;
+static int16_t g_saved_x, g_saved_y, g_saved_w, g_saved_h;
+static int16_t fullscreen_lock_count = 0;
 
 #ifndef __GEMLIB_AES
 extern int16_t gl_apid;
@@ -114,6 +122,8 @@ int16_t cursor_is_hidden;
 int16_t work_in[11];
 int16_t work_out[57];
 int16_t work_out_extended[57];
+
+const char *win_title = NULL;
 
 MFDB mm_wi_mfdb = { 0 };
 MFDB screen_mfdb = { 0 };
@@ -544,6 +554,92 @@ static int milan_vampire_gpio_clock(void)
     return ((gpio & 1L) == 0L) ? 1 : 2;
 }
 
+static void fullscreen_lock(void)
+{
+    wind_update(BEG_UPDATE);   /* verrouille l'écran AES */
+    if (fullscreen_lock_count == 0) {
+        graf_mouse(M_OFF, NULL);
+        cursor_is_hidden = TRUE;
+    }
+    fullscreen_lock_count++;
+    form_dial(FMD_START, 0, 0, 0, 0, xdesk, ydesk, wdesk, hdesk);
+}
+
+static void fullscreen_unlock(void)
+{
+    form_dial(FMD_FINISH, 0, 0, 0, 0, xdesk, ydesk, wdesk, hdesk);
+    fullscreen_lock_count--;
+    if (fullscreen_lock_count <= 0) {
+        fullscreen_lock_count = 0;
+        graf_mouse(M_ON, NULL);
+        cursor_is_hidden = FALSE;
+    }
+    wind_update(END_UPDATE);   /* déverrouille l'écran AES */
+}
+
+static void hide_mouse(void)
+{
+    if (fullscreen_lock_count > 0) return;   /* souris déjà verrouillée par fullscreen */
+    if (!cursor_is_hidden) {
+        graf_mouse(M_OFF, NULL);
+        cursor_is_hidden = TRUE;
+    }
+}
+
+static void show_mouse(void)
+{
+    if (fullscreen_lock_count > 0) return;   /* garder cachée en plein écran */
+    if (cursor_is_hidden) {
+        graf_mouse(M_ON, NULL);
+        cursor_is_hidden = FALSE;
+    }
+}
+
+static void vid_compute_fullscreen_offset(void)
+{
+    g_vid_off_x = 0;
+    g_vid_off_y = 0;
+    if (g_vid.stream_index < 0) return;
+    if (wwork > (int16_t)g_vid.width)  g_vid_off_x = (wwork - (int16_t)g_vid.width) >> 1;
+    if (hwork > (int16_t)g_vid.height) g_vid_off_y = (hwork - (int16_t)g_vid.height) >> 1;
+}
+
+static void vid_fill_black_bars_once(void)
+{
+    if (g_vid_off_x <= 0 && g_vid_off_y <= 0) return;
+
+    short old_rgb0[3], black[3] = {0, 0, 0};
+    int16_t bg_pxy[4];
+
+    vq_color(handle, 0, 0, old_rgb0);
+    vs_color(handle, 0, black);
+    vsf_color(handle, 0);
+    vsf_interior(handle, 1);
+    vsf_perimeter(handle, 0);
+    set_clip(1, xwork, ywork, wwork, hwork);
+
+    if (g_vid_off_y > 0) {
+        bg_pxy[0] = xwork;               bg_pxy[1] = ywork;
+        bg_pxy[2] = xwork + wwork - 1;   bg_pxy[3] = ywork + g_vid_off_y - 1;
+        vr_recfl(handle, bg_pxy);
+        int16_t bot = ywork + g_vid_off_y + (int16_t)g_vid.height;
+        bg_pxy[0] = xwork;               bg_pxy[1] = bot;
+        bg_pxy[2] = xwork + wwork - 1;   bg_pxy[3] = ywork + hwork - 1;
+        vr_recfl(handle, bg_pxy);
+    }
+    if (g_vid_off_x > 0) {
+        bg_pxy[0] = xwork;               bg_pxy[1] = ywork + g_vid_off_y;
+        bg_pxy[2] = xwork + g_vid_off_x - 1;
+        bg_pxy[3] = ywork + g_vid_off_y + (int16_t)g_vid.height - 1;
+        vr_recfl(handle, bg_pxy);
+        int16_t rx = xwork + g_vid_off_x + (int16_t)g_vid.width;
+        bg_pxy[0] = rx;                  bg_pxy[1] = ywork + g_vid_off_y;
+        bg_pxy[2] = xwork + wwork - 1;   bg_pxy[3] = bg_pxy[3];
+        vr_recfl(handle, bg_pxy);
+    }
+
+    vs_color(handle, 0, old_rgb0);
+}
 
 static void shadow_push(AVPacket *pkt) {   /* CHANGED: blocking */
     pthread_mutex_lock(&g_shadow_mutex);
@@ -608,22 +704,6 @@ static const char *get_basename(const char *path)
         if (*p == '/' || *p == '\\') base = p + 1;
     }
     return base;
-}
-
-static void hide_mouse(void)
-{
-    if (!cursor_is_hidden) {
-        graf_mouse(M_OFF, NULL);
-        cursor_is_hidden = TRUE;
-    }
-}
-
-static void show_mouse(void)
-{
-    if (cursor_is_hidden) {
-        graf_mouse(M_ON, NULL);
-        cursor_is_hidden = FALSE;
-    }
 }
 
 static void open_vwork(void)
@@ -1394,6 +1474,99 @@ static void draw_audio_only_time(void)
     }
 }
 
+static void apply_fullscreen(void)
+{
+    if (g_fullscreen == g_fs_requested) return;
+
+    /* Fermer et détruire l'ancienne fenêtre */
+    wind_close(wi_handle);
+    wind_delete(wi_handle);
+
+    if (g_fs_requested) {
+        /* Sauvegarde de la géométrie fenêtrée SEULEMENT si on vient du mode fenêtré */
+        if (!g_fullscreen && g_saved_w > 0 && g_saved_h > 0) {
+            /* déjà sauvé par WM_MOVED ou par l'init, on garde */
+        } else if (!g_fullscreen) {
+            /* fallback si jamais sauvé */
+            g_saved_x = xdesk + 80;
+            g_saved_y = ydesk + 20;
+            int16_t tmp_ox, tmp_oy;
+            int16_t def_w = (int16_t)MIN(g_vid.width, wdesk - 20);
+            int16_t def_h = (int16_t)MIN(g_vid.height, hdesk - 80);
+            wind_calc(WC_BORDER, MOVER | CLOSER | NAME,
+                      0, 0, def_w, def_h,
+                      &tmp_ox, &tmp_oy, &g_saved_w, &g_saved_h);
+        }
+
+        fullscreen_lock();
+
+        /* Fenêtre sans bordures, taille du bureau */
+        wi_handle = wind_create(0, xdesk, ydesk, wdesk, hdesk);
+        wind_open(wi_handle, xdesk, ydesk, wdesk, hdesk);
+
+        wind_get(wi_handle, WF_WORKXYWH, &xwork, &ywork, &wwork, &hwork);
+        wind_get(wi_handle, WF_CURRXYWH, &xext, &yext, &wext, &hext);
+
+        vid_compute_fullscreen_offset();
+        vid_fill_black_bars_once();   /* ← AJOUT : une seule fois */
+        mm_ico_win_delta_y = 0;   /* pas de barre d'icônes en plein écran */
+        g_fullscreen = true;          /* ← assure que g_fullscreen est mis */        
+    } else {
+        /* Retour fenêtré : d'abord rendre l'écran, PUIS créer la fenêtre */
+        fullscreen_unlock();
+
+        int16_t open_x, open_y, open_w, open_h;
+
+        if (g_saved_w > 0 && g_saved_h > 0) {
+            open_x = g_saved_x;
+            open_y = g_saved_y;
+            open_w = g_saved_w;
+            open_h = g_saved_h;
+        } else {
+            /* Jamais été fenêtré dans cette session → calcul par défaut */
+            int16_t win_w = (int16_t)g_vid.width;
+            int16_t win_h = (int16_t)g_vid.height;
+            if (win_w > wdesk - 20) win_w = wdesk - 20;
+            if (win_h > hdesk - 80) win_h = hdesk - 80;
+
+            int16_t outer_x, outer_y;
+            wind_calc(WC_BORDER, MOVER | CLOSER | NAME,
+                      0, 0, win_w, win_h,
+                      &outer_x, &outer_y, &open_w, &open_h);
+
+            open_x = xdesk + 80;
+            open_y = ydesk + 20;
+        }
+
+        wi_handle = wind_create(MOVER | CLOSER | NAME, xdesk, ydesk, wdesk, hdesk);
+        wind_set_str(wi_handle, WF_NAME, win_title);
+        wind_open(wi_handle, open_x, open_y, open_w, open_h);
+
+        wind_get(wi_handle, WF_WORKXYWH, &xwork, &ywork, &wwork, &hwork);
+        wind_get(wi_handle, WF_CURRXYWH, &xext, &yext, &wext, &hext);
+
+        mm_ico_win_delta_y = 40;
+        ico_update_x(2, wwork - 72, -1);
+        g_vid_off_x = 0;
+        g_vid_off_y = 0;
+        g_fullscreen = false;        
+    }
+
+    mm_ico_pxy_control_bar[0] = xwork;
+    mm_ico_pxy_control_bar[1] = ywork + hwork - mm_ico_win_delta_y;
+    mm_ico_pxy_control_bar[2] = xwork + wwork;
+    mm_ico_pxy_control_bar[3] = ywork + hwork;
+
+    /* Recrée le splash à la nouvelle taille s'il est actif */
+    if (g_splash_active) {
+        splash_free();
+        splash_init();
+    }
+
+    g_fullscreen = g_fs_requested;
+    st_Send_WM_REDRAW();
+}
+
 static void *exec_eventloop(void * /*p*/)
 {
     control_bar[0].handler = toggle_pause;
@@ -1447,7 +1620,9 @@ static void *exec_eventloop(void * /*p*/)
         }
 
         if (event & MU_BUTTON) {
-            if (mb == 2 && xwork < mx && mx < (xwork + wwork) &&
+            /* Clic droit : toggle barre d'icônes (UNIQUEMENT en mode fenêtré) */
+            if (mb == 2 && !g_fullscreen &&
+                xwork < mx && mx < (xwork + wwork) &&
                 ywork < my && my < (ywork + hwork)) {
                 mm_ico_win_delta_y = (mm_ico_win_delta_y > 0) ? 0 : 40;
                 mm_ico_pxy_control_bar[0] = xwork;
@@ -1472,13 +1647,11 @@ static void *exec_eventloop(void * /*p*/)
                     st_Send_WM_REDRAW();
                 }
             }
-            if (mb == 1 && mm_ico_win_delta_y > 0 &&
+            /* Clic gauche sur la barre d'icônes (UNIQUEMENT si elle est visible) */
+            if (mb == 1 && mm_ico_win_delta_y > 0 && !g_fullscreen &&
                 xwork < mx && mx < (xwork + wwork) &&
                 ywork < my && my < (ywork + hwork)) {
                 ico_handle(mx, my, mb);
-                /* REMOVED: redundant ico_draw_bar() here — toggle_pause/mute
-                 * now call ico_refresh_bar() which handles both redraw
-                 * and blit for audio-only mode. */
                 if (!g_playback_started) {
                     st_Send_WM_REDRAW();
                 }
@@ -1501,11 +1674,19 @@ static void *exec_eventloop(void * /*p*/)
                 } else {
                     toggle_pause();
                 }
+            } else if (ascii == 'f' || ascii == 'F') {
+                if (g_vid.stream_index >= 0) {
+                    g_fs_requested = !g_fs_requested;
+                }                
             } else if (scancode == 0x48) {
                 if (g_snd.stream_index >= 0) vol_up();
             } else if (scancode == 0x50) {
                 if (g_snd.stream_index >= 0) vol_down();
             }
+        }
+
+        if (g_fs_requested != g_fullscreen) {
+            apply_fullscreen();
         }
 
         wind_update(FALSE);
@@ -1914,12 +2095,21 @@ static void vid_init(const char *filename)
 
         int stride = MFDB_STRIDE(g_vid.width);
         mm_wi_mfdb.fd_addr = g_vid_ring_buf; 
-        mm_wi_mfdb.fd_w = g_vid.width; mm_wi_mfdb.fd_h = g_vid.height;
-        mm_wi_mfdb.fd_wdwidth = stride >> 4; mm_wi_mfdb.fd_stand = 0; mm_wi_mfdb.fd_nplanes = g_vid.screen_bpp;
+        mm_wi_mfdb.fd_w = g_vid.width; 
+        mm_wi_mfdb.fd_h = g_vid.height;
+        mm_wi_mfdb.fd_wdwidth = stride >> 4; 
+        mm_wi_mfdb.fd_stand = 0; 
+        mm_wi_mfdb.fd_nplanes = g_vid.screen_bpp;
 
         printf("Video: %dx%d  %.2f fps  stream=%d  codec=%s\n",
                g_vid.width, g_vid.height, g_vid.fps, g_vid.stream_index,
                g_vid.codec_ctx->codec->long_name);
+               
+        /* Pré-calcul des champs statiques de la barre de contrôle */
+        mm_control_bar_mfdb.fd_w       = MFDB_STRIDE(g_vid.width);
+        mm_control_bar_mfdb.fd_wdwidth = MFDB_STRIDE(g_vid.width) >> 4;
+        mm_control_bar_mfdb.fd_stand   = 0;
+        mm_control_bar_mfdb.fd_nplanes = g_vid.screen_bpp;               
     }
 
 audio_init:
@@ -2150,16 +2340,11 @@ static void *thread_vid_display(void * /*p*/)
             int16_t bpp = g_vid.screen_bpp;
             int16_t bytes_per_pixel = (bpp == 24) ? 3 : (bpp / 8);
             int frame_row_bytes = (int)g_vid.width * bytes_per_pixel;
-            int mfdb_stride = MFDB_STRIDE(g_vid.width);
 
             mm_control_bar_mfdb.fd_addr = (char *)mm_wi_mfdb.fd_addr +
                 (g_vid.height - mm_ico_win_delta_y) * frame_row_bytes;
-            mm_control_bar_mfdb.fd_w       = mfdb_stride;
-            mm_control_bar_mfdb.fd_h       = mm_ico_win_delta_y;
-            mm_control_bar_mfdb.fd_wdwidth = mfdb_stride >> 4;
-            mm_control_bar_mfdb.fd_stand   = 0;
-            mm_control_bar_mfdb.fd_nplanes = bpp;
-
+            mm_control_bar_mfdb.fd_h = mm_ico_win_delta_y;
+            /* fd_w, fd_h, fd_wdwidth, fd_stand, fd_nplanes déjà pré-calculés */
             ico_handle(0, 0, 0);
         }
 
@@ -2168,42 +2353,59 @@ static void *thread_vid_display(void * /*p*/)
             GRECT dst_rect;
             int16_t win_xy[8];
 
-            dst_rect.g_x = xwork;
-            dst_rect.g_y = ywork;
+            dst_rect.g_x = xwork + g_vid_off_x;
+            dst_rect.g_y = ywork + g_vid_off_y;
             dst_rect.g_w = g_vid.width;
             dst_rect.g_h = g_vid.height;
 
-            hide_mouse();
-            wind_update(BEG_UPDATE);
-            wind_get(wi_handle, WF_FIRSTXYWH, &rect.g_x, &rect.g_y, &rect.g_w, &rect.g_h);
-            while (rect.g_h != 0 && rect.g_w != 0) {
-                if (rc_intersect(&dst_rect, &rect)) {
-                    /* CHANGED: source offset = how much of the top-left is clipped */
-                    int16_t src_x = rect.g_x - xwork;
-                    int16_t src_y = rect.g_y - ywork;
-                    int16_t dst_x = rect.g_x;
-                    int16_t dst_y = rect.g_y;
-                    int16_t w = rect.g_w;
-                    int16_t h = rect.g_h;
+            if (g_fullscreen) {
+                /* Pas de hide/show/wind_update ici : déjà verrouillé par fullscreen_lock() */
+                win_xy[0] = 0;
+                win_xy[1] = 0;
+                win_xy[2] = (int16_t)g_vid.width - 1;
+                win_xy[3] = (int16_t)g_vid.height - 1;
+                win_xy[4] = dst_rect.g_x;
+                win_xy[5] = dst_rect.g_y;
+                win_xy[6] = dst_rect.g_x + (int16_t)g_vid.width - 1;
+                win_xy[7] = dst_rect.g_y + (int16_t)g_vid.height - 1;
 
-                    win_xy[0] = src_x;
-                    win_xy[1] = src_y;
-                    win_xy[2] = src_x + w - 1;
-                    win_xy[3] = src_y + h - 1;
-                    win_xy[4] = dst_x;
-                    win_xy[5] = dst_y;
-                    win_xy[6] = dst_x + w - 1;
-                    win_xy[7] = dst_y + h - 1;
+                set_clip(1, dst_rect.g_x, dst_rect.g_y,
+                         (int16_t)g_vid.width, (int16_t)g_vid.height);
+                vro_cpyfm(handle, S_ONLY, win_xy, &mm_wi_mfdb, &screen_mfdb);
+            } else {
+                hide_mouse();
+                wind_update(BEG_UPDATE);
 
-                    set_clip(1, rect.g_x, rect.g_y, rect.g_w, rect.g_h);
-                    vro_cpyfm(handle, S_ONLY, win_xy, &mm_wi_mfdb, &screen_mfdb);
+                wind_get(wi_handle, WF_FIRSTXYWH,
+                         &rect.g_x, &rect.g_y, &rect.g_w, &rect.g_h);
+                while (rect.g_h != 0 && rect.g_w != 0) {
+                    if (rc_intersect(&dst_rect, &rect)) {
+                        int16_t src_x = rect.g_x - dst_rect.g_x;
+                        int16_t src_y = rect.g_y - dst_rect.g_y;
+                        int16_t w = rect.g_w;
+                        int16_t h = rect.g_h;
+
+                        win_xy[0] = src_x;
+                        win_xy[1] = src_y;
+                        win_xy[2] = src_x + w - 1;
+                        win_xy[3] = src_y + h - 1;
+                        win_xy[4] = rect.g_x;
+                        win_xy[5] = rect.g_y;
+                        win_xy[6] = rect.g_x + w - 1;
+                        win_xy[7] = rect.g_y + h - 1;
+
+                        set_clip(1, rect.g_x, rect.g_y, rect.g_w, rect.g_h);
+                        vro_cpyfm(handle, S_ONLY, win_xy,
+                                  &mm_wi_mfdb, &screen_mfdb);
+                    }
+                    wind_get(wi_handle, WF_NEXTXYWH,
+                             &rect.g_x, &rect.g_y, &rect.g_w, &rect.g_h);
                 }
-                wind_get(wi_handle, WF_NEXTXYWH, &rect.g_x, &rect.g_y, &rect.g_w, &rect.g_h);
+                wind_update(END_UPDATE);
+                show_mouse();
             }
-            wind_update(END_UPDATE);
-            show_mouse();
         }
-
+        
         g_vid_tail = (g_vid_tail + 1) % VID_BUF_SIZE;
         g_vid.frame_counter++;
     }
@@ -2243,7 +2445,6 @@ int main(int argc, char *argv[])
     pthread_t thread_demux, thread_vid_display_id, thread_audio, thread_eventloop, thread_aud_ui;
     char path_buf[512];
     const char *filename = NULL;
-    const char *win_title = NULL;
 
 set_bin_directory(argv[0]);
 
@@ -2253,6 +2454,8 @@ set_bin_directory(argv[0]);
             g_disable_resample = true;
         } else if (strcmp(argv[i], "--direct-play") == 0) {
             g_direct_play = true;
+        } else if (strcmp(argv[i], "--fullscreen") == 0) {
+            g_fs_requested = true;            
         } else if (first_file_arg < 0) {
             first_file_arg = i;
         }
@@ -2304,6 +2507,11 @@ set_bin_directory(argv[0]);
     cursor_is_hidden = FALSE;
     av_log_set_level(AV_LOG_QUIET);
 
+    g_saved_x = xdesk + 80;
+    g_saved_y = ydesk + 20;
+    g_saved_w = 0;
+    g_saved_h = 0;
+
     bool first_run = true;
 
     do {   /* restart loop */
@@ -2324,6 +2532,13 @@ set_bin_directory(argv[0]);
         g_shadow_tail = 0;
         memset(g_audio_shadow, 0, sizeof(g_audio_shadow));
 
+        if (!first_run)
+            g_fs_requested = false;   // preserve --fullscreen arg on first pass
+
+        g_fullscreen = false;
+        g_saved_w = 0;
+        g_saved_h = 0;
+
         detect_machine_type();
         vid_init(filename);
         if (app_end) break;
@@ -2341,7 +2556,44 @@ set_bin_directory(argv[0]);
                 int win_h = (int)g_vid.height;
                 if (win_w > wdesk - 20) win_w = wdesk - 20;
                 if (win_h > hdesk - 80) win_h = hdesk - 80;
-                open_window(win_w, win_h, win_title);
+                /* Prépare une géométrie fenêtrée par défaut au cas où on toggle */
+                g_saved_x = xdesk + 80;
+                g_saved_y = ydesk + 20;
+
+                int16_t tmp_ox, tmp_oy;
+                int16_t def_w = (int16_t)win_w;
+                int16_t def_h = (int16_t)win_h;
+
+                wind_calc(WC_BORDER, MOVER | CLOSER | NAME,
+                          0, 0, def_w, def_h,
+                          &tmp_ox, &tmp_oy, &g_saved_w, &g_saved_h);
+
+                /* Prépare une géométrie fenêtrée par défaut au cas où on toggle */
+                {
+                    int16_t tmp_ox, tmp_oy;
+                    wind_calc(WC_BORDER, MOVER | CLOSER | NAME,
+                              0, 0, win_w, win_h,
+                              &tmp_ox, &tmp_oy, &g_saved_w, &g_saved_h);
+                    g_saved_x = xdesk + 80;
+                    g_saved_y = ydesk + 20;
+                }
+
+                if (g_fs_requested) {
+                    fullscreen_lock();
+                    wi_handle = wind_create(0, xdesk, ydesk, wdesk, hdesk);
+                    wind_open(wi_handle, xdesk, ydesk, wdesk, hdesk);
+                    wind_set(wi_handle, WF_TOP, 0, 0, 0, 0);
+                    wind_get(wi_handle, WF_WORKXYWH, &xwork, &ywork, &wwork, &hwork);
+                    wind_get(wi_handle, WF_CURRXYWH, &xext, &yext, &wext, &hext);
+
+                    vid_compute_fullscreen_offset();
+                    vid_fill_black_bars_once();                   
+                    mm_ico_win_delta_y = 0;
+                    g_fullscreen = true;
+                } else {
+                    open_window(win_w, win_h, win_title);
+                }
+
                 ico_update_x(2, wwork - 72, -1);
                 if (g_direct_play) {
                     g_playback_started = true;
@@ -2511,6 +2763,9 @@ set_bin_directory(argv[0]);
         mm_wi_mfdb.fd_addr = NULL;
     }
     ico_free();
+    if (g_fullscreen) {
+        fullscreen_unlock();
+    }    
     wind_close(wi_handle);
     wind_delete(wi_handle);
     v_clsvwk(handle);
